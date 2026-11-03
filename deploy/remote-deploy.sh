@@ -3,9 +3,9 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: remote-arm64-deploy.sh --image IMAGE [options]
+Usage: remote-deploy.sh --image IMAGE [options]
 
-Install Docker when necessary and deploy Sub2API on an ARM64 Linux server.
+Install Docker when necessary and deploy Sub2API on an AMD64 or ARM64 Linux server.
 
 Options:
   --image IMAGE       Release image to deploy (required)
@@ -56,8 +56,12 @@ if [[ -n "$image" && ! "$image" =~ ^[a-zA-Z0-9._/:@-]+$ ]]; then
 fi
 
 case "$(uname -m)" in
-  aarch64|arm64) ;;
-  *) echo "This deployment script only supports ARM64 servers; found $(uname -m)." >&2; exit 1 ;;
+  x86_64|amd64) server_arch=amd64 ;;
+  aarch64|arm64) server_arch=arm64 ;;
+  *)
+    echo "Unsupported server architecture: $(uname -m). Expected x86_64/amd64 or aarch64/arm64." >&2
+    exit 1
+    ;;
 esac
 
 if ((EUID == 0)); then
@@ -102,7 +106,7 @@ random_hex() {
 
 install_docker
 if [[ "$prepare_only" == true ]]; then
-  echo "Docker Engine and the Compose plugin are ready."
+  echo "Docker Engine and the Compose plugin are ready on ${server_arch}."
   exit 0
 fi
 
@@ -148,4 +152,4 @@ fi
 "${sudo_cmd[@]}" docker compose --project-directory "$deploy_dir" up -d --remove-orphans
 "${sudo_cmd[@]}" docker compose --project-directory "$deploy_dir" ps
 
-echo "Sub2API ${image} is deployed from ${deploy_dir}."
+echo "Sub2API ${image} is deployed for ${server_arch} from ${deploy_dir}."
