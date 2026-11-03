@@ -406,3 +406,100 @@ jobs:
           git add backend/cmd/server/VERSION
           git commit -m "chore: sync VERSION to ${VERSION} [skip ci]"
           git push origin HEAD:${{ github.event.repository.default_branch }}
+
+  deploy-arm64:
+    name: Deploy to ARM64 server
+    needs: [prepare, release]
+    if: ${{ needs.release.result == 'success' && needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.simple != 'true' && vars.ENABLE_ARM64_DEPLOY == 'true' }}
+    runs-on: ubuntu-latest
+    environment: arm64-production
+    permissions:
+      contents: read
+      packages: read
+    env:
+      DEPLOY_HOST: ${{ secrets.ARM64_HOST }}
+      DEPLOY_USER: ${{ secrets.ARM64_USER }}
+      DEPLOY_PORT: ${{ secrets.ARM64_SSH_PORT || '22' }}
+      DEPLOY_PATH: ${{ vars.ARM64_DEPLOY_PATH || '/opt/sub2api' }}
+      RELEASE_IMAGE: ghcr.io/${{ needs.prepare.outputs.owner_lower }}/sub2api:${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Validate deployment configuration
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.ARM64_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.ARM64_SSH_KNOWN_HOSTS }}
+        run: |
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_USER"
+          test -n "$SSH_PRIVATE_KEY"
+          test -n "$SSH_KNOWN_HOSTS"
+          [[ "$DEPLOY_PATH" == /* && "$DEPLOY_PATH" != / ]]
+          [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ ]]
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.ARM64_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.ARM64_SSH_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Prepare optional managed environment
+        id: managed-env
+        env:
+          MANAGED_ENV: ${{ secrets.ARM64_DEPLOY_ENV }}
+        run: |
+          if [[ -n "$MANAGED_ENV" ]]; then
+            printf '%s\n' "$MANAGED_ENV" > "$RUNNER_TEMP/sub2api.env"
+            chmod 600 "$RUNNER_TEMP/sub2api.env"
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload deployment files
+        run: |
+          remote_tmp="/tmp/sub2api-release-${{ github.run_id }}"
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "install -d -m 700 '$remote_tmp'"
+          scp -P "$DEPLOY_PORT" deploy/docker-compose.yml deploy/remote-arm64-deploy.sh \
+            "$DEPLOY_USER@$DEPLOY_HOST:$remote_tmp/"
+          if [[ "${{ steps.managed-env.outputs.present }}" == true ]]; then
+            scp -P "$DEPLOY_PORT" "$RUNNER_TEMP/sub2api.env" \
+              "$DEPLOY_USER@$DEPLOY_HOST:$remote_tmp/deployment.env"
+          fi
+
+      - name: Install or check Docker
+        run: |
+          remote_tmp="/tmp/sub2api-release-${{ github.run_id }}"
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "sudo bash '$remote_tmp/remote-arm64-deploy.sh' --prepare-only"
+
+      - name: Authenticate to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "sudo docker login ghcr.io --username '${{ github.repository_owner }}' --password-stdin"
+
+      - name: Install Docker and deploy release
+        run: |
+          remote_tmp="/tmp/sub2api-release-${{ github.run_id }}"
+          env_arg=""
+          if [[ "${{ steps.managed-env.outputs.present }}" == true ]]; then
+            env_arg="--env-file $remote_tmp/deployment.env"
+          fi
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "sudo bash '$remote_tmp/remote-arm64-deploy.sh' --image '$RELEASE_IMAGE' --deploy-dir '$DEPLOY_PATH' --compose-file '$remote_tmp/docker-compose.yml' $env_arg"
+
+      - name: Clean up remote credentials and temporary files
+        if: ${{ always() }}
+        run: |
+          remote_tmp="/tmp/sub2api-release-${{ github.run_id }}"
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "sudo docker logout ghcr.io >/dev/null 2>&1 || true; rm -rf '$remote_tmp'" || true
